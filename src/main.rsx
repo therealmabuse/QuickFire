@@ -3,10 +3,9 @@ use num_bigint::BigUint;
 use num_cpus;
 use num_traits::ToPrimitive;
 use rand::{rngs::ThreadRng, Rng};
-use ripemd::{Digest, Ripemd160};
+use ripemd::{Digest as RipemdDigest, Ripemd160};
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
-use sha2::{Sha256, Digest as Sha256Digest};
-use std::collections::HashSet;
+use sha2::Sha256;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -14,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, select};
 use ctrlc;
+use std::collections::HashSet;
 
 fn sha256_digest(data: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
@@ -89,8 +89,8 @@ fn generate_random_in_range(rng: &mut ThreadRng, start: &BigUint, end: &BigUint)
 fn main() {
     println!("=== Optimized BTC Paper Wallet Maker with Batched Range Search ===");
 
-    let start_hex = "000000000000000000000000000000000000000000000054a4df70ae8667c25e";
-    let end_hex   = "000000000000000000000000000000000000000000001b1deb465ac2074cd33a";
+    let start_hex = "000000000000000000000000000000000000000000000064a4df70ae8667c25e";
+    let end_hex   = "000000000000000000000000000000000000000000000079edefffffffffffff";
                      
     let mut start = hex_to_biguint(start_hex);
     let mut end = hex_to_biguint(end_hex);
@@ -169,57 +169,45 @@ fn main() {
     };
 
     if mode == "1" {
-        // Improved sequential search with proper batch distribution
-        let batch_size = 1_000_000u64; // Larger batch size for better performance
-        let total_range = end.clone() - start.clone();
-        let total_batches = (total_range.clone() / batch_size) + 1u64;
+        // Sequential search mode - improved with work stealing
+        let current_position = Arc::new(std::sync::Mutex::new(start.clone()));
         
-        println!("Total batches to process: {}", total_batches);
-        
-        // Create a channel for distributing batches
-        let (batch_sender, batch_receiver) = bounded(num_threads * 2);
-        
-        // Batch producer thread
-        {
-            let batch_sender = batch_sender.clone();
-            let start = start.clone();
-            let end = end.clone();
-            thread::spawn(move || {
-                let mut current = start;
-                while current < end {
-                    let batch_end = std::cmp::min(&current + batch_size, end.clone());
-                    if batch_sender.send((current.clone(), batch_end.clone())).is_err() {
-                        break; // Receiver dropped, exit
-                    }
-                    current = batch_end;
-                }
-            });
-        }
-
-        // Worker threads
         for _ in 0..num_threads {
             let target_addresses = Arc::clone(&target_addresses);
             let secp = Arc::clone(&secp);
             let found = Arc::clone(&found);
             let key_counter = Arc::clone(&key_counter);
+            let current_position = Arc::clone(&current_position);
             let status_sender = status_sender.clone();
+            let end = end.clone();
             let shutdown = shutdown.clone();
             let result_sender = result_sender.clone();
-            let batch_receiver = batch_receiver.clone();
 
             thread::spawn(move || {
                 let mut local_counter = 0u64;
                 let mut last_report_time = Instant::now();
+                let batch_size = 100_000u64;
                 
-                while !found.load(Ordering::SeqCst) && !shutdown.load(Ordering::SeqCst) {
-                    let (batch_start, batch_end) = match batch_receiver.recv() {
-                        Ok(batch) => batch,
-                        Err(_) => break, // No more batches
+                loop {
+                    if found.load(Ordering::Relaxed) || shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    // Get next batch
+                    let (batch_start, batch_end) = {
+                        let mut pos = current_position.lock().unwrap();
+                        if *pos >= end {
+                            break; // No more work
+                        }
+                        let batch_start = pos.clone();
+                        *pos += batch_size;
+                        let batch_end = std::cmp::min(pos.clone(), end.clone());
+                        (batch_start, batch_end)
                     };
 
                     let mut current = batch_start;
                     while current < batch_end {
-                        if found.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
+                        if found.load(Ordering::Relaxed) || shutdown.load(Ordering::SeqCst) {
                             break;
                         }
 
@@ -241,7 +229,7 @@ fn main() {
                             }
 
                             if target_addresses.contains(&address) {
-                                found.store(true, Ordering::SeqCst);
+                                found.store(true, Ordering::Relaxed);
                                 let _ = result_sender.send((current, address));
                                 break;
                             }
@@ -271,7 +259,7 @@ fn main() {
                 let mut last_report_time = Instant::now();
                 
                 loop {
-                    if found.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
+                    if found.load(Ordering::Relaxed) || shutdown.load(Ordering::SeqCst) {
                         break;
                     }
 
@@ -294,7 +282,7 @@ fn main() {
                         }
 
                         if target_addresses.contains(&address) {
-                            found.store(true, Ordering::SeqCst);
+                            found.store(true, Ordering::Relaxed);
                             let _ = result_sender.send((current, address));
                             break;
                         }
