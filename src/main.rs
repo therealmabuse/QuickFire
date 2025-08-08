@@ -7,9 +7,12 @@ use ripemd::{Digest as RipemdDigest, Ripemd160};
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use sha2::Sha256;
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use crossbeam_channel::{bounded, select};
+use ctrlc;
 
 fn sha256_digest(data: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
@@ -85,9 +88,9 @@ fn generate_random_in_range(rng: &mut ThreadRng, start: &BigUint, end: &BigUint)
 fn main() {
     println!("=== Optimized BTC Paper Wallet Maker with Batched Range Search ===");
 
-    let start_hex = "000000000000000000000000000000000000000000000061b6cdd0d367fdfce8";
-    let end_hex   = "00000000000000000000000000000000000000000000006efedeffffffffffff";
-
+    let start_hex = "000000000000000000000000000000000000000000000064a4df70ae8667c25e";
+    let end_hex   = "000000000000000000000000000000000000000000000079edefffffffffffff";
+                     
     let mut start = hex_to_biguint(start_hex);
     let mut end = hex_to_biguint(end_hex);
 
@@ -110,32 +113,41 @@ fn main() {
     let mode = mode.trim();
 
     let num_threads = num_cpus::get();
-    let batches_per_thread = 3;
-    let total_batches = num_threads * batches_per_thread;
-
-    println!(
-        "Using {} workers with {} batches each...\n",
-        num_threads, batches_per_thread
-    );
+    println!("Using {} workers...\n", num_threads);
 
     let target_address = Arc::new(target_address);
     let secp = Arc::new(Secp256k1::new());
-    let found = Arc::new(Mutex::new(None));
-    let last_status = Arc::new(Mutex::new((BigUint::default(), String::new())));
-    let key_counter = Arc::new(Mutex::new(0u64));
+    let found = Arc::new(AtomicBool::new(false));
+    let key_counter = Arc::new(AtomicU64::new(0));
     let start_time = Instant::now();
+    let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Status thread: last key, addr, keys/sec
-    {
-        let last_status = Arc::clone(&last_status);
+    // Setup Ctrl-C handler
+    let shutdown_clone = shutdown.clone();
+    ctrlc::set_handler(move || {
+        shutdown_clone.store(true, Ordering::SeqCst);
+        println!("\nReceived shutdown signal, finishing current work...");
+    }).expect("Error setting Ctrl-C handler");
+
+    // Channel for status updates
+    let (status_sender, status_receiver) = bounded(1024);
+    // Channel for results
+    let (result_sender, result_receiver) = bounded(1);
+
+    // Status thread
+    let status_thread = {
         let key_counter = Arc::clone(&key_counter);
         thread::spawn(move || {
             let mut last_count = 0u64;
+            let mut last_status = (BigUint::default(), String::new());
 
             loop {
-                thread::sleep(Duration::from_secs(45));
-                let (hex, addr) = &*last_status.lock().unwrap();
-                let total = *key_counter.lock().unwrap();
+                // Process all pending status updates
+                while let Ok((hex, addr)) = status_receiver.try_recv() {
+                    last_status = (hex, addr);
+                }
+
+                let total = key_counter.load(Ordering::Relaxed);
                 let delta = total - last_count;
                 last_count = total;
                 let elapsed = start_time.elapsed().as_secs().max(1);
@@ -143,83 +155,107 @@ fn main() {
 
                 println!(
                     "[Status] Last key: {:x} | Addr: {} | ΔKeys: {} | Avg: {:.2} keys/sec",
-                    hex, addr, delta, avg_kps
+                    last_status.0, last_status.1, delta, avg_kps
                 );
-            }
-        });
-    }
 
-    let mut handles = vec![];
+                thread::sleep(Duration::from_secs(45));
+            }
+        })
+    };
 
     if mode == "1" {
-        // Sequential search mode (original)
-        let total_range = &end - &start;
-        let batch_size = &total_range / BigUint::from(total_batches as u32);
-
-        for i in 0..total_batches {
-            let batch_start = &start + &batch_size * BigUint::from(i as u32);
-            let batch_end = if i == total_batches - 1 {
-                end.clone()
-            } else {
-                &batch_start + &batch_size
-            };
-
+        // Sequential search mode - improved with work stealing
+        let current_position = Arc::new(std::sync::Mutex::new(start.clone()));
+        
+        for _ in 0..num_threads {
             let target_address = Arc::clone(&target_address);
             let secp = Arc::clone(&secp);
             let found = Arc::clone(&found);
-            let last_status = Arc::clone(&last_status);
             let key_counter = Arc::clone(&key_counter);
+            let current_position = Arc::clone(&current_position);
+            let status_sender = status_sender.clone();
+            let end = end.clone();
+            let shutdown = shutdown.clone();
+            let result_sender = result_sender.clone();
 
-            let handle = thread::spawn(move || {
-                let mut current = batch_start.clone();
-                while current < batch_end {
-                    if found.lock().unwrap().is_some() {
-                        return;
+            thread::spawn(move || {
+                let mut local_counter = 0u64;
+                let mut last_report_time = Instant::now();
+                let batch_size = 100_000u64;
+                
+                loop {
+                    if found.load(Ordering::Relaxed) || shutdown.load(Ordering::Relaxed) {
+                        break;
                     }
 
-                    let priv_bytes = biguint_to_32bytes(&current);
-                    if let Ok(secret_key) = SecretKey::from_slice(&priv_bytes) {
-                        let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-                        let address = public_key_to_p2pkh_address(&public_key);
+                    // Get next batch
+                    let (batch_start, batch_end) = {
+                        let mut pos = current_position.lock().unwrap();
+                        if *pos >= end {
+                            break; // No more work
+                        }
+                        let batch_start = pos.clone();
+                        *pos += batch_size;
+                        let batch_end = std::cmp::min(pos.clone(), end.clone());
+                        (batch_start, batch_end)
+                    };
 
-                        {
-                            let mut status = last_status.lock().unwrap();
-                            *status = (current.clone(), address.clone());
+                    let mut current = batch_start;
+                    while current < batch_end {
+                        if found.load(Ordering::Relaxed) || shutdown.load(Ordering::Relaxed) {
+                            break;
                         }
 
-                        {
-                            let mut counter = key_counter.lock().unwrap();
-                            *counter += 1;
+                        let priv_bytes = biguint_to_32bytes(&current);
+                        if let Ok(secret_key) = SecretKey::from_slice(&priv_bytes) {
+                            let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+                            let address = public_key_to_p2pkh_address(&public_key);
+
+                            // Send status update occasionally
+                            if last_report_time.elapsed() > Duration::from_secs(5) {
+                                let _ = status_sender.send((current.clone(), address.clone()));
+                                last_report_time = Instant::now();
+                            }
+
+                            local_counter += 1;
+                            if local_counter >= 10_000 {
+                                key_counter.fetch_add(local_counter, Ordering::Relaxed);
+                                local_counter = 0;
+                            }
+
+                            if address == *target_address {
+                                found.store(true, Ordering::Relaxed);
+                                let _ = result_sender.send((current, address));
+                                break;
+                            }
                         }
 
-                        if address == *target_address {
-                            *found.lock().unwrap() = Some((current, address));
-                            return;
-                        }
+                        current += 1u32;
                     }
-
-                    current += 1u32;
                 }
             });
-
-            handles.push(handle);
         }
     } else {
         // Random search mode
-        for _ in 0..total_batches {
+        for _ in 0..num_threads {
             let target_address = Arc::clone(&target_address);
             let secp = Arc::clone(&secp);
             let found = Arc::clone(&found);
-            let last_status = Arc::clone(&last_status);
             let key_counter = Arc::clone(&key_counter);
+            let status_sender = status_sender.clone();
             let start_range = start.clone();
             let end_range = end.clone();
+            let shutdown = shutdown.clone();
+            let result_sender = result_sender.clone();
 
-            let handle = thread::spawn(move || {
+            thread::spawn(move || {
                 let mut rng = rand::thread_rng();
+                let mut local_counter = 0u64;
+                let mut last_report_time = Instant::now();
+                
                 loop {
-                    if found.lock().unwrap().is_some() {
-                        return;
+                    if found.load(Ordering::Relaxed) || shutdown.load(Ordering::Relaxed) {
+                        break;
                     }
 
                     let current = generate_random_in_range(&mut rng, &start_range, &end_range);
@@ -228,41 +264,57 @@ fn main() {
                         let public_key = PublicKey::from_secret_key(&secp, &secret_key);
                         let address = public_key_to_p2pkh_address(&public_key);
 
-                        {
-                            let mut status = last_status.lock().unwrap();
-                            *status = (current.clone(), address.clone());
+                        // Send status update occasionally
+                        if last_report_time.elapsed() > Duration::from_secs(5) {
+                            let _ = status_sender.send((current.clone(), address.clone()));
+                            last_report_time = Instant::now();
                         }
 
-                        {
-                            let mut counter = key_counter.lock().unwrap();
-                            *counter += 1;
+                        local_counter += 1;
+                        if local_counter >= 10_000 {
+                            key_counter.fetch_add(local_counter, Ordering::Relaxed);
+                            local_counter = 0;
                         }
 
                         if address == *target_address {
-                            *found.lock().unwrap() = Some((current, address));
-                            return;
+                            found.store(true, Ordering::Relaxed);
+                            let _ = result_sender.send((current, address));
+                            break;
                         }
                     }
                 }
             });
-
-            handles.push(handle);
         }
     }
 
-    for handle in handles {
-        handle.join().unwrap();
+    // Wait for results or shutdown
+    select! {
+        recv(result_receiver) -> result => {
+            if let Ok((key, addr)) = result {
+                println!("\n✅ MATCH FOUND!");
+                println!("Private Key (hex): {:x}", key);
+                println!("Address: {}", addr);
+            }
+        },
+        default(Duration::from_secs(1)) => {
+            while !shutdown.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(100));
+            }
+            println!("\n🛑 Shutdown requested. Finalizing...");
+        }
     }
 
-    let result = found.lock().unwrap();
-    match &*result {
-        Some((key, addr)) => {
-            println!("\n✅ MATCH FOUND!");
-            println!("Private Key (hex): {:x}", key);
-            println!("Address: {}", addr);
-        }
-        None => {
-            println!("\n❌ No match found in the defined range.");
-        }
-    }
+    // Signal all threads to stop
+    found.store(true, Ordering::SeqCst);
+    shutdown.store(true, Ordering::SeqCst);
+
+    // Wait for status thread to finish
+    status_thread.join().unwrap();
+
+    let total_keys = key_counter.load(Ordering::Relaxed);
+    let elapsed = start_time.elapsed().as_secs_f64();
+    println!("\nFinal statistics:");
+    println!("Total keys checked: {}", total_keys);
+    println!("Total time: {:.2} seconds", elapsed);
+    println!("Average speed: {:.2} keys/sec", total_keys as f64 / elapsed);
 }
