@@ -1,337 +1,303 @@
-use hex::decode as hex_decode;
-use num_bigint::BigUint;
-use num_cpus;
-use num_traits::ToPrimitive;
-use rand::{rngs::ThreadRng, Rng};
-use ripemd::{Digest, Ripemd160};
-use secp256k1::{PublicKey, Secp256k1, SecretKey};
-use sha2::{Sha256, Digest as Sha256Digest};
-use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use crossbeam_channel::{bounded, select};
-use ctrlc;
+use bitcoin::{PublicKey, Address, Network};
+use bitcoin::secp256k1::{Secp256k1, All};
+use std::fs::OpenOptions;
+use std::io::Write;
+use rand::Rng;
+use hex;
 
-fn sha256_digest(data: &[u8]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hasher.finalize().to_vec()
-}
+static STOP: AtomicBool = AtomicBool::new(false);
+static KEY_COUNT: AtomicU64 = AtomicU64::new(0);
 
-fn ripemd160_digest(data: &[u8]) -> Vec<u8> {
-    let mut hasher = Ripemd160::new();
-    hasher.update(data);
-    hasher.finalize().to_vec()
-}
-
-fn base58_encode(data: &[u8]) -> String {
-    const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    let mut num = BigUint::from_bytes_be(data);
-    let base = BigUint::from(ALPHABET.len());
-    let mut encoded = String::new();
-
-    while &num > &BigUint::from(0u32) {
-        let rem = (&num % &base).to_usize().unwrap();
-        num /= &base;
-        encoded.insert(0, ALPHABET.chars().nth(rem).unwrap());
-    }
-
-    for &_byte in data.iter().take_while(|&&b| b == 0) {
-        encoded.insert(0, '1');
-    }
-
-    encoded
-}
-
-fn public_key_to_p2pkh_address(public_key: &PublicKey) -> String {
-    let pubkey_bytes = public_key.serialize();
-    let sha256 = sha256_digest(&pubkey_bytes);
-    let ripemd160 = ripemd160_digest(&sha256);
-
-    let mut address_bytes = vec![0x00];
-    address_bytes.extend(&ripemd160);
-    let checksum = &sha256_digest(&sha256_digest(&address_bytes))[..4];
-    address_bytes.extend(checksum);
-    base58_encode(&address_bytes)
-}
-
-fn hex_to_biguint(hex: &str) -> BigUint {
-    BigUint::from_bytes_be(&hex_decode(hex).expect("Invalid hex"))
-}
-
-fn biguint_to_32bytes(b: &BigUint) -> [u8; 32] {
-    let mut bytes = b.to_bytes_be();
-    if bytes.len() > 32 {
-        panic!("BigUint too large to fit in 32 bytes");
-    }
-    while bytes.len() < 32 {
-        bytes.insert(0, 0);
-    }
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&bytes);
-    result
-}
-
-fn generate_random_in_range(rng: &mut ThreadRng, start: &BigUint, end: &BigUint) -> BigUint {
-    let range = end - start;
-    let bytes = range.to_bytes_be();
-    let mut random_bytes = vec![0u8; bytes.len()];
-    
-    rng.fill(&mut random_bytes[..]);
-    
-    let random_num = BigUint::from_bytes_be(&random_bytes);
-    start + (random_num % range)
+struct Status {
+    last_key: String,
+    last_address: String,
+    start_time: Instant,
 }
 
 fn main() {
-    println!("=== Optimized BTC Paper Wallet Maker with Batched Range Search ===");
-
-    let start_hex = "000000000000000000000000000000000000000000000054a4df70ae8667c25e";
-    let end_hex   = "000000000000000000000000000000000000000000001b1deb465ac2074cd33a";
-                     
-    let mut start = hex_to_biguint(start_hex);
-    let mut end = hex_to_biguint(end_hex);
-
-    if start > end {
-        std::mem::swap(&mut start, &mut end);
+    println!("Bitcoin Private Key Hunter");
+    println!("--------------------------");
+    
+    // Get range input
+    let from = get_input("Enter starting hex (e.g., 0000...0001): ");
+    let to = get_input("Enter ending hex (e.g., ffff...ffff): ");
+    
+    // Validate inputs
+    if from.len() != to.len() {
+        println!("Error: Start and end must be the same length");
+        return;
     }
-
-    println!("Search range:\nFrom: {}\nTo:   {}\n", start_hex, end_hex);
-
-    print!("Enter the Bitcoin addresses to search for (comma separated): ");
-    io::stdout().flush().unwrap();
-    let mut target_addresses_input = String::new();
-    io::stdin().read_line(&mut target_addresses_input).unwrap();
-    let target_addresses: HashSet<String> = target_addresses_input
-        .trim()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect();
-
-    print!("Choose search mode (1 - Sequential, 2 - Random): ");
-    io::stdout().flush().unwrap();
-    let mut mode = String::new();
-    io::stdin().read_line(&mut mode).unwrap();
-    let mode = mode.trim();
-
-    let num_threads = num_cpus::get();
-    println!("Using {} workers...\n", num_threads);
-
-    let target_addresses = Arc::new(target_addresses);
-    let secp = Arc::new(Secp256k1::new());
-    let found = Arc::new(AtomicBool::new(false));
-    let key_counter = Arc::new(AtomicU64::new(0));
-    let start_time = Instant::now();
-    let shutdown = Arc::new(AtomicBool::new(false));
-
-    // Setup Ctrl-C handler
-    let shutdown_clone = shutdown.clone();
+    
+    // Find the common static prefix
+    let static_prefix = find_common_prefix(&from, &to);
+    let varying_part_length = from.len() - static_prefix.len();
+    
+    // Get target address
+    let target_address = get_input("Enter target Bitcoin address (compressed P2PKH): ");
+    
+    // Menu
+    println!("\nSelect mode:");
+    println!("1. Normal mode");
+    println!("2. Crazy mode 1 (alternating letters/numbers)");
+    println!("3. Crazy mode 2 (alternating pairs)");
+    
+    let choice = get_input("Enter choice (1-3): ");
+    
+    // Setup CTRL+C handler
     ctrlc::set_handler(move || {
-        shutdown_clone.store(true, Ordering::SeqCst);
-        println!("\nReceived shutdown signal, finishing current work...");
+        STOP.store(true, Ordering::SeqCst);
+        println!("\nStopping... Please wait for current operations to complete.");
     }).expect("Error setting Ctrl-C handler");
-
-    // Channel for status updates
-    let (status_sender, status_receiver) = bounded(1024);
-    // Channel for results
-    let (result_sender, result_receiver) = bounded(1);
-
-    // Status thread
-    let status_thread = {
-        let key_counter = Arc::clone(&key_counter);
-        thread::spawn(move || {
-            let mut last_count = 0u64;
-            let mut last_status = (BigUint::default(), String::new());
-
-            loop {
-                // Process all pending status updates
-                while let Ok((hex, addr)) = status_receiver.try_recv() {
-                    last_status = (hex, addr);
-                }
-
-                let total = key_counter.load(Ordering::Relaxed);
-                let delta = total - last_count;
-                last_count = total;
-                let elapsed = start_time.elapsed().as_secs().max(1);
-                let avg_kps = total as f64 / elapsed as f64;
-
-                println!(
-                    "[Status] Last key: {:x} | Addr: {} | ΔKeys: {} | Avg: {:.2} keys/sec",
-                    last_status.0, last_status.1, delta, avg_kps
-                );
-
-                thread::sleep(Duration::from_secs(45));
+    
+    // Get number of threads (use all available cores)
+    let num_threads = num_cpus::get();
+    println!("\nStarting {} worker threads...", num_threads);
+    
+    // Create shared status tracker
+    let status = Arc::new(std::sync::Mutex::new(Status {
+        last_key: String::new(),
+        last_address: String::new(),
+        start_time: Instant::now(),
+    }));
+    
+    // Start status thread
+    let status_clone = status.clone();
+    thread::spawn(move || {
+        let mut last_count = 0;
+        loop {
+            thread::sleep(Duration::from_secs(45));
+            if STOP.load(Ordering::SeqCst) {
+                break;
             }
-        })
-    };
-
-    if mode == "1" {
-        // Improved sequential search with proper batch distribution
-        let batch_size = 1_000_000u64; // Larger batch size for better performance
-        let total_range = end.clone() - start.clone();
-        let total_batches = (total_range.clone() / batch_size) + 1u64;
-        
-        println!("Total batches to process: {}", total_batches);
-        
-        // Create a channel for distributing batches
-        let (batch_sender, batch_receiver) = bounded(num_threads * 2);
-        
-        // Batch producer thread
-        {
-            let batch_sender = batch_sender.clone();
-            let start = start.clone();
-            let end = end.clone();
-            thread::spawn(move || {
-                let mut current = start;
-                while current < end {
-                    let batch_end = std::cmp::min(&current + batch_size, end.clone());
-                    if batch_sender.send((current.clone(), batch_end.clone())).is_err() {
-                        break; // Receiver dropped, exit
-                    }
-                    current = batch_end;
-                }
-            });
+            
+            let status = status_clone.lock().unwrap();
+            let current_count = KEY_COUNT.load(Ordering::SeqCst);
+            let elapsed = status.start_time.elapsed().as_secs();
+            let rate = if elapsed > 0 {
+                (current_count - last_count) / 45
+            } else {
+                0
+            };
+            
+            println!("\n--- Status Update ---");
+            println!("Total keys checked: {}", current_count);
+            println!("Keys per second: {}", rate);
+            println!("Last key: {}", status.last_key);
+            println!("Last address: {}", status.last_address);
+            println!("Elapsed time: {} seconds", elapsed);
+            println!("-------------------");
+            
+            last_count = current_count;
         }
-
-        // Worker threads
-        for _ in 0..num_threads {
-            let target_addresses = Arc::clone(&target_addresses);
-            let secp = Arc::clone(&secp);
-            let found = Arc::clone(&found);
-            let key_counter = Arc::clone(&key_counter);
-            let status_sender = status_sender.clone();
-            let shutdown = shutdown.clone();
-            let result_sender = result_sender.clone();
-            let batch_receiver = batch_receiver.clone();
-
-            thread::spawn(move || {
-                let mut local_counter = 0u64;
-                let mut last_report_time = Instant::now();
+    });
+    
+    // Create worker threads
+    let mut handles = vec![];
+    let target_address = Arc::new(target_address);
+    
+    for _ in 0..num_threads {
+        let from = from.clone();
+        let to = to.clone();
+        let static_prefix = static_prefix.clone();
+        let target_address = target_address.clone();
+        let choice = choice.clone();
+        let status = status.clone();
+        
+        let handle = thread::spawn(move || {
+            let secp: Secp256k1<All> = Secp256k1::new();
+            let mut rng = rand::thread_rng();
+            let mut local_count = 0;
+            
+            while !STOP.load(Ordering::SeqCst) {
+                let private_key = match choice.trim() {
+                    "1" => generate_normal(&from, &to, &static_prefix, varying_part_length, &mut rng),
+                    "2" => generate_crazy1(&from, &to, &static_prefix, varying_part_length, &mut rng),
+                    "3" => generate_crazy2(&from, &to, &static_prefix, varying_part_length, &mut rng),
+                    _ => continue,
+                };
                 
-                while !found.load(Ordering::SeqCst) && !shutdown.load(Ordering::SeqCst) {
-                    let (batch_start, batch_end) = match batch_receiver.recv() {
-                        Ok(batch) => batch,
-                        Err(_) => break, // No more batches
-                    };
-
-                    let mut current = batch_start;
-                    while current < batch_end {
-                        if found.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
-                            break;
-                        }
-
-                        let priv_bytes = biguint_to_32bytes(&current);
-                        if let Ok(secret_key) = SecretKey::from_slice(&priv_bytes) {
-                            let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-                            let address = public_key_to_p2pkh_address(&public_key);
-
-                            // Send status update occasionally
-                            if last_report_time.elapsed() > Duration::from_secs(5) {
-                                let _ = status_sender.send((current.clone(), address.clone()));
-                                last_report_time = Instant::now();
-                            }
-
-                            local_counter += 1;
-                            if local_counter >= 10_000 {
-                                key_counter.fetch_add(local_counter, Ordering::Relaxed);
-                                local_counter = 0;
-                            }
-
-                            if target_addresses.contains(&address) {
-                                found.store(true, Ordering::SeqCst);
-                                let _ = result_sender.send((current, address));
-                                break;
-                            }
-                        }
-
-                        current += 1u32;
+                if let Some(address) = private_key_to_address(&private_key, &secp) {
+                    // Update status
+                    {
+                        let mut status = status.lock().unwrap();
+                        status.last_key = private_key.clone();
+                        status.last_address = address.clone();
                     }
-                }
-            });
-        }
-    } else {
-        // Random search mode
-        for _ in 0..num_threads {
-            let target_addresses = Arc::clone(&target_addresses);
-            let secp = Arc::clone(&secp);
-            let found = Arc::clone(&found);
-            let key_counter = Arc::clone(&key_counter);
-            let status_sender = status_sender.clone();
-            let start_range = start.clone();
-            let end_range = end.clone();
-            let shutdown = shutdown.clone();
-            let result_sender = result_sender.clone();
-
-            thread::spawn(move || {
-                let mut rng = rand::thread_rng();
-                let mut local_counter = 0u64;
-                let mut last_report_time = Instant::now();
-                
-                loop {
-                    if found.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
+                    
+                    local_count += 1;
+                    if local_count % 10000 == 0 {
+                        KEY_COUNT.fetch_add(10000, Ordering::SeqCst);
+                        local_count = 0;
+                    }
+                    
+                    if address == *target_address {
+                        found_match(&private_key, &address);
+                        STOP.store(true, Ordering::SeqCst);
                         break;
                     }
-
-                    let current = generate_random_in_range(&mut rng, &start_range, &end_range);
-                    let priv_bytes = biguint_to_32bytes(&current);
-                    if let Ok(secret_key) = SecretKey::from_slice(&priv_bytes) {
-                        let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-                        let address = public_key_to_p2pkh_address(&public_key);
-
-                        // Send status update occasionally
-                        if last_report_time.elapsed() > Duration::from_secs(5) {
-                            let _ = status_sender.send((current.clone(), address.clone()));
-                            last_report_time = Instant::now();
-                        }
-
-                        local_counter += 1;
-                        if local_counter >= 10_000 {
-                            key_counter.fetch_add(local_counter, Ordering::Relaxed);
-                            local_counter = 0;
-                        }
-
-                        if target_addresses.contains(&address) {
-                            found.store(true, Ordering::SeqCst);
-                            let _ = result_sender.send((current, address));
-                            break;
-                        }
-                    }
                 }
-            });
-        }
-    }
-
-    // Wait for results or shutdown
-    select! {
-        recv(result_receiver) -> result => {
-            if let Ok((key, addr)) = result {
-                println!("\n✅ MATCH FOUND!");
-                println!("Private Key (hex): {:x}", key);
-                println!("Address: {}", addr);
             }
-        },
-        default(Duration::from_secs(1)) => {
-            while !shutdown.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(100));
-            }
-            println!("\n🛑 Shutdown requested. Finalizing...");
-        }
+            KEY_COUNT.fetch_add(local_count, Ordering::SeqCst);
+        });
+        handles.push(handle);
     }
-
-    // Signal all threads to stop
-    found.store(true, Ordering::SeqCst);
-    shutdown.store(true, Ordering::SeqCst);
-
-    // Wait for status thread to finish
-    status_thread.join().unwrap();
-
-    let total_keys = key_counter.load(Ordering::Relaxed);
-    let elapsed = start_time.elapsed().as_secs_f64();
-    println!("\nFinal statistics:");
+    
+    // Wait for all threads to complete
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    
+    let elapsed = status.lock().unwrap().start_time.elapsed().as_secs();
+    let total_keys = KEY_COUNT.load(Ordering::SeqCst);
+    println!("\nScanning stopped.");
+    println!("Final stats:");
     println!("Total keys checked: {}", total_keys);
-    println!("Total time: {:.2} seconds", elapsed);
-    println!("Average speed: {:.2} keys/sec", total_keys as f64 / elapsed);
+    println!("Total time: {} seconds", elapsed);
+    println!("Average speed: {} keys/sec", total_keys / elapsed.max(1));
+}
+
+// [Rest of the functions remain exactly the same as in previous version]
+
+fn get_input(prompt: &str) -> String {
+    println!("{}", prompt);
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).expect("Failed to read input");
+    input.trim().to_string()
+}
+
+fn find_common_prefix(a: &str, b: &str) -> String {
+    let mut prefix = String::new();
+    for (ca, cb) in a.chars().zip(b.chars()) {
+        if ca == cb {
+            prefix.push(ca);
+        } else {
+            break;
+        }
+    }
+    prefix
+}
+
+fn generate_normal(
+    from: &str,
+    to: &str,
+    static_prefix: &str,
+    varying_length: usize,
+    rng: &mut impl Rng
+) -> String {
+    let from_num = u128::from_str_radix(&from[static_prefix.len()..], 16)
+        .expect("Invalid start hex varying part");
+    let to_num = u128::from_str_radix(&to[static_prefix.len()..], 16)
+        .expect("Invalid end hex varying part");
+    
+    let random_num = rng.gen_range(from_num..=to_num);
+    format!("{}{:0width$x}", static_prefix, random_num, width = varying_length)
+}
+
+fn generate_crazy1(
+    from: &str,
+    to: &str,
+    static_prefix: &str,
+    varying_length: usize,
+    rng: &mut impl Rng
+) -> String {
+    let from_num = u128::from_str_radix(&from[static_prefix.len()..], 16)
+        .expect("Invalid start hex varying part");
+    let to_num = u128::from_str_radix(&to[static_prefix.len()..], 16)
+        .expect("Invalid end hex varying part");
+    
+    let random_num = rng.gen_range(from_num..=to_num);
+    let hex_str = format!("{:0width$x}", random_num, width = varying_length);
+    
+    let mut result = String::new();
+    let mut next_letter = rng.gen_bool(0.5);
+    
+    for _ in hex_str.chars() {
+        if next_letter {
+            result.push(get_random_hex_letter(rng));
+        } else {
+            result.push(get_random_hex_digit(rng));
+        }
+        next_letter = !next_letter;
+    }
+    
+    format!("{}{}", static_prefix, result)
+}
+
+fn generate_crazy2(
+    from: &str,
+    to: &str,
+    static_prefix: &str,
+    varying_length: usize,
+    rng: &mut impl Rng
+) -> String {
+    let from_num = u128::from_str_radix(&from[static_prefix.len()..], 16)
+        .expect("Invalid start hex varying part");
+    let to_num = u128::from_str_radix(&to[static_prefix.len()..], 16)
+        .expect("Invalid end hex varying part");
+    
+    let random_num = rng.gen_range(from_num..=to_num);
+    let hex_str = format!("{:0width$x}", random_num, width = varying_length);
+    
+    let mut result = String::new();
+    let mut next_letter = rng.gen_bool(0.5);
+    let mut count = 0;
+    
+    for _ in hex_str.chars() {
+        if count == 2 {
+            next_letter = !next_letter;
+            count = 0;
+        }
+        
+        if next_letter {
+            result.push(get_random_hex_letter(rng));
+        } else {
+            result.push(get_random_hex_digit(rng));
+        }
+        count += 1;
+    }
+    
+    format!("{}{}", static_prefix, result)
+}
+
+fn get_random_hex_letter(rng: &mut impl Rng) -> char {
+    let letters = ['a', 'b', 'c', 'd', 'e', 'f'];
+    letters[rng.gen_range(0..letters.len())]
+}
+
+fn get_random_hex_digit(rng: &mut impl Rng) -> char {
+    let digits = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+    digits[rng.gen_range(0..digits.len())]
+}
+
+fn private_key_to_address(private_key: &str, secp: &Secp256k1<All>) -> Option<String> {
+    if let Ok(bytes) = hex::decode(private_key) {
+        if let Ok(secret_key) = bitcoin::PrivateKey::from_slice(&bytes, Network::Bitcoin) {
+            let public_key = PublicKey::from_private_key(secp, &secret_key);
+            let address = Address::p2pkh(&public_key, Network::Bitcoin);
+            return Some(address.to_string());
+        }
+    }
+    None
+}
+
+fn found_match(private_key: &str, address: &str) {
+    println!("\nMATCH FOUND!");
+    println!("Address: {}", address);
+    println!("Private Key: {}", private_key);
+    
+    // Save to file
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("found_keys.txt")
+        .expect("Unable to open file");
+    
+    writeln!(file, "Address: {}", address).expect("Unable to write to file");
+    writeln!(file, "Private Key: {}", private_key).expect("Unable to write to file");
+    writeln!(file, "----------------------").expect("Unable to write to file");
 }
