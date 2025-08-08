@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use bitcoin::{PublicKey, Address, Network};
 use bitcoin::secp256k1::{Secp256k1, All};
 use std::fs::OpenOptions;
@@ -37,8 +39,18 @@ fn main() {
     let static_prefix = find_common_prefix(&from, &to);
     let varying_part_length = from.len() - static_prefix.len();
     
-    // Get target address
-    let target_address = get_input("Enter target Bitcoin address (compressed P2PKH): ");
+    // Get target addresses from file
+    let target_file = get_input("Enter path to target addresses file: ");
+    let target_addresses = match read_addresses_from_file(&target_file) {
+        Ok(addrs) => {
+            println!("Loaded {} target addresses", addrs.len());
+            addrs
+        },
+        Err(e) => {
+            println!("Error reading addresses file: {}", e);
+            return;
+        }
+    };
     
     // Menu
     println!("\nSelect mode:");
@@ -98,13 +110,13 @@ fn main() {
     
     // Create worker threads
     let mut handles = vec![];
-    let target_address = Arc::new(target_address);
+    let target_addresses = Arc::new(target_addresses);
     
     for _ in 0..num_threads {
         let from = from.clone();
         let to = to.clone();
         let static_prefix = static_prefix.clone();
-        let target_address = target_address.clone();
+        let target_addresses = target_addresses.clone();
         let choice = choice.clone();
         let status = status.clone();
         
@@ -135,7 +147,8 @@ fn main() {
                         local_count = 0;
                     }
                     
-                    if address == *target_address {
+                    // Check against all target addresses
+                    if target_addresses.contains(&address) {
                         found_match(&private_key, &address);
                         STOP.store(true, Ordering::SeqCst);
                         break;
@@ -161,7 +174,22 @@ fn main() {
     println!("Average speed: {} keys/sec", total_keys / elapsed.max(1));
 }
 
-// [Rest of the functions remain exactly the same as in previous version]
+fn read_addresses_from_file(path: &str) -> io::Result<Vec<String>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut addresses = Vec::new();
+    
+    for line in reader.lines() {
+        let line = line?.trim().to_string();
+        if !line.is_empty() {
+            addresses.push(line);
+        }
+    }
+    
+    Ok(addresses)
+}
+
+// [All other functions remain exactly the same as in previous version]
 
 fn get_input(prompt: &str) -> String {
     println!("{}", prompt);
